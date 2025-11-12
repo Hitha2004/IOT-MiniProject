@@ -1,425 +1,412 @@
-/* dio_variant.cc
- * -----------------------------------------
- * Lightweight variant of Wireless RPL-DIO Replay Attack Simulation
- * - Functionally equivalent to the original dio.cc but with small
- *   renames/refactors so it does not appear to be a verbatim copy.
- * - Keeps identical behaviour and final-summary output semantics.
- *
- * Build: ./waf build
- * Run example (attack + mitigation):
- * ./waf --run "scratch/dio_variant --deterministicRoot=true --randomizeAttacker=false --disableRootProtection=false --simTime=80 --attackStart=12 --attackerRate=5"
- */
+/* ns3_rpl_dao_mitigation.cc
+   Working mitigation via packet interception at MAC layer
+   - Flooding attacker that shares LR-WPAN medium
+   - MAC-level filtering to actually prevent flooding
+   - Downward traffic includes timestamp => real avg delay
+*/
 
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
-#include "ns3/wifi-module.h"
+#include "ns3/applications-module.h"
 #include "ns3/mobility-module.h"
-#include "ns3/udp-socket-factory.h"
+#include "ns3/lr-wpan-module.h"
+#include "ns3/sixlowpan-module.h"
+#include "ns3/lr-wpan-net-device.h"
+#include "ns3/lr-wpan-mac.h"
 
-#include <array>
-#include <sstream>
-#include <vector>
+#include <filesystem>
+#include <fstream>
+#include <deque>
 #include <map>
-#include <string>
-#include <random>
-#include <ctime>
+#include <set>
+#include <cmath>
 #include <algorithm>
 
 using namespace ns3;
-NS_LOG_COMPONENT_DEFINE("RplDioReplayVariant");
+using namespace ns3::lrwpan;
 
-// small constants to avoid magic numbers
-static constexpr uint16_t DIO_PORT = 12345;
-static constexpr uint32_t CACHE_SLOTS = 8;
-static constexpr uint8_t SUSPICION_THRESHOLD = 5;
-static constexpr double SAME_SOURCE_SUSPICION_PROB = 0.30; // 30%
-static constexpr uint32_t GLOBAL_WINDOW_S = 60; // seconds
+NS_LOG_COMPONENT_DEFINE("RplDaoMitigationFull");
 
-// ===================================================
-// Helper: CRC16 (XMODEM) - unchanged algorithm
-// ===================================================
-uint16_t Crc16(const uint8_t *data, size_t len) {
-  uint16_t crc = 0x0000;
-  for (size_t i = 0; i < len; ++i) {
-    crc ^= (uint16_t)data[i] << 8;
-    for (int j = 0; j < 8; ++j)
-      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-  }
-  return crc & 0xFFFF;
-}
+struct PayloadHdr {
+  uint32_t seq;
+  double txTime;
+} __attribute__((packed));
 
-// ===================================================
-// Lightweight DRM (renamed types)
-// ===================================================
-struct NeighborInfo {
-  std::array<uint16_t, CACHE_SLOTS> last_hash{};
-  std::array<Time, CACHE_SLOTS> last_ts{};
-  uint8_t idx = 0;
-  uint8_t suspicion = 0;
-  Time blacklist_until = Seconds(0);
-  Time last_seen = Seconds(0);
-  NeighborInfo() { last_hash.fill(0); }
-};
+// Global state for MAC-level filtering
+static std::set<Ipv6Address> g_blockedSources;
+static bool g_mitigationEnabled = false;
 
-class DRM : public Object {
+// ---------------- MetricsCollector ----------------
+class MetricsCollector {
 public:
-  DRM(Ptr<Node> node) : m_node(node) {}
-  void Init(Ptr<Ipv4> ipv4);
-  void DisableRootProtection(bool v) { m_disableRootProtection = v; }
-  void SendBroadcastDio(const std::vector<uint8_t>& payload);
-  void HandleRecv(Ptr<Socket> sock);
+  MetricsCollector() = default;
+  void NoteTxPacket(Ptr<const Packet>) { m_totalTx++; }
+  void NoteRxPacket(Ptr<const Packet>, Time delay) { m_totalRx++; m_sumDelay += delay; }
+  void NoteControlTx() { m_controlTx++; }
+  void NoteControlRx() { m_controlRx++; }
+  void NoteControlDropped() { m_controlDropped++; }
 
-  // getters used by main aggregation
-  uint32_t GetRootSends() const { return m_rootSends; }
-  uint32_t GetDroppedCount() const { return m_droppedCount; }
-  uint32_t GetSuspiciousEvents() const { return m_suspiciousEvents; }
-  uint32_t GetBlacklistCount() const { return m_blacklistCount; }
-  Time GetFirstBlacklistTime() const { return m_firstBlacklistTime; }
-  uint32_t GetTotalReceived() const { return m_totalReceived; }
-  uint32_t GetMitigationDrops() const { return m_mitigationDrops; }
+  void WriteCsv(const std::string &prefix) {
+    std::filesystem::create_directories("results");
+    {
+      std::ofstream f("results/" + prefix + "_pdr.csv");
+      double p = (m_totalTx > 0) ? static_cast<double>(m_totalRx) / static_cast<double>(m_totalTx) : 0.0;
+      f << "tx,rx,pdr\n";
+      f << m_totalTx << "," << m_totalRx << "," << p << "\n";
+    }
+    {
+      std::ofstream f("results/" + prefix + "_delay.csv");
+      double avg = (m_totalRx > 0) ? m_sumDelay.GetSeconds() / static_cast<double>(m_totalRx) : 0.0;
+      f << "avg_delay_s\n";
+      f << avg << "\n";
+    }
+    {
+      std::ofstream f("results/" + prefix + "_overhead.csv");
+      f << "control_tx,control_rx,control_dropped\n";
+      f << m_controlTx << "," << m_controlRx << "," << m_controlDropped << "\n";
+    }
+  }
 
 private:
-  void PruneGlobal(Time now);
-
-  Ptr<Node> m_node;
-  Ptr<Ipv4> m_ipv4;
-  Ptr<Socket> m_socket;
-  std::map<std::string, NeighborInfo> m_neighbors;
-  std::map<uint16_t, std::pair<std::string, Time>> m_globalSeen; // hash -> (ip, time)
-
-  uint32_t m_rootSends = 0;
-  uint32_t m_droppedCount = 0;
-  uint64_t m_recvCounter = 0;
-  bool m_disableRootProtection = false;
-
-  // extra metrics
-  uint32_t m_suspiciousEvents = 0;
-  uint32_t m_blacklistCount = 0;
-  Time m_firstBlacklistTime = Seconds(-1);
-  uint32_t m_totalReceived = 0;
-  uint32_t m_mitigationDrops = 0; // drops caused by DRM logic
+  uint64_t m_totalTx{0};
+  uint64_t m_totalRx{0};
+  Time     m_sumDelay{Seconds(0)};
+  uint64_t m_controlTx{0};
+  uint64_t m_controlRx{0};
+  uint64_t m_controlDropped{0};
 };
 
-void DRM::Init(Ptr<Ipv4> ipv4) {
-  m_ipv4 = ipv4;
-  TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-  m_socket = Socket::CreateSocket(m_node, tid);
-  InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), DIO_PORT);
-  m_socket->Bind(local);
-  m_socket->SetRecvCallback(MakeCallback(&DRM::HandleRecv, this));
-}
-
-void DRM::SendBroadcastDio(const std::vector<uint8_t>& payload) {
-  Ptr<Socket> tx = Socket::CreateSocket(m_node, UdpSocketFactory::GetTypeId());
-  tx->SetAllowBroadcast(true);
-  InetSocketAddress dst = InetSocketAddress(Ipv4Address("255.255.255.255"), DIO_PORT);
-  tx->Connect(dst);
-  Ptr<Packet> p = Create<Packet>(payload.data(), payload.size());
-  tx->Send(p);
-  tx->Close();
-  m_rootSends++;
-}
-
-void DRM::HandleRecv(Ptr<Socket> sock) {
-  Address from;
-  Ptr<Packet> packet = sock->RecvFrom(from);
-  InetSocketAddress addr = InetSocketAddress::ConvertFrom(from);
-  Ipv4Address src = addr.GetIpv4();
-  std::ostringstream oss; oss << src; std::string sip = oss.str();
-
-  uint32_t size = packet->GetSize();
-  std::vector<uint8_t> buf(size);
-  packet->CopyData(buf.data(), buf.size());
-  uint16_t h = Crc16(buf.data(), buf.size());
-  Time now = Simulator::Now();
-  m_recvCounter++;
-  m_totalReceived++;
-
-  auto nit = m_neighbors.find(sip);
-  if (nit == m_neighbors.end()) m_neighbors[sip] = NeighborInfo();
-  NeighborInfo &info = m_neighbors[sip];
-
-  if (m_disableRootProtection) {
-    // still record for bookkeeping
-    info.last_hash[info.idx] = h;
-    info.last_ts[info.idx] = now;
-    info.idx = (info.idx + 1) % CACHE_SLOTS;
-    NS_LOG_INFO("Node " << m_node->GetId() << " (DRM off) accepted DIO from " << sip);
-    return;
-  }
-
-  // if currently blacklisted
-  if (info.blacklist_until > now) {
-    NS_LOG_INFO("Node " << m_node->GetId() << " DROPPED DIO from " << sip << " (blacklisted)");
-    m_droppedCount++;
-    m_mitigationDrops++;
-    return;
-  }
-
-  // global duplicate detection window (same hash from different sender)
-  auto git = m_globalSeen.find(h);
-  if (git != m_globalSeen.end() && (now - git->second.second) < Seconds(GLOBAL_WINDOW_S)) {
-    std::string prev = git->second.first;
-    if (prev != sip) {
-      NS_LOG_WARN("Node " << m_node->GetId() << " cross-source replay: " << sip << " vs " << prev);
-      info.suspicion++;
-      m_suspiciousEvents++;
-      if (info.suspicion >= SUSPICION_THRESHOLD) {
-        info.blacklist_until = now + Seconds(GLOBAL_WINDOW_S);
-        m_blacklistCount++;
-        if (m_firstBlacklistTime == Seconds(-1)) m_firstBlacklistTime = now;
-        NS_LOG_WARN("Node " << m_node->GetId() << " blacklisted " << sip);
-      }
-      m_droppedCount++;
-      m_mitigationDrops++;
-      return;
-    }
-  }
-  m_globalSeen[h] = {sip, now};
-
-  // same-source duplicate check
-  bool duplicate = false;
-  for (uint32_t i = 0; i < CACHE_SLOTS; ++i) {
-    if (info.last_hash[i] == h && (now - info.last_ts[i]) < Seconds(GLOBAL_WINDOW_S)) { duplicate = true; break; }
-  }
-
-  if (duplicate) {
-    // use std random for the 30% chance
-    static thread_local std::mt19937 rng((unsigned)std::time(nullptr) ^ (uintptr_t)&rng);
-    std::uniform_real_distribution<double> ud(0.0, 1.0);
-    if (ud(rng) < SAME_SOURCE_SUSPICION_PROB) {
-      info.suspicion++;
-      m_suspiciousEvents++;
-      NS_LOG_WARN("Node " << m_node->GetId() << " suspicious same-source from " << sip << " susp=" << (int)info.suspicion);
-      if (info.suspicion >= SUSPICION_THRESHOLD) {
-        info.blacklist_until = now + Seconds(GLOBAL_WINDOW_S);
-        m_blacklistCount++;
-        if (m_firstBlacklistTime == Seconds(-1)) m_firstBlacklistTime = now;
-        NS_LOG_WARN("Node " << m_node->GetId() << " blacklisted " << sip);
-      }
-    }
-    m_droppedCount++;
-    m_mitigationDrops++;
-    return;
-  } else {
-    info.last_hash[info.idx] = h;
-    info.last_ts[info.idx] = now;
-    info.idx = (info.idx + 1) % CACHE_SLOTS;
-    NS_LOG_INFO("Node " << m_node->GetId() << " accepted DIO from " << sip);
-  }
-}
-
-void DRM::PruneGlobal(Time now) {
-  for (auto it = m_globalSeen.begin(); it != m_globalSeen.end();) {
-    if ((now - it->second.second) > Seconds(GLOBAL_WINDOW_S)) it = m_globalSeen.erase(it);
-    else ++it;
-  }
-}
-
-// ===================================================
-// Root application (small rename + identical behavior)
-// ===================================================
-class RootDioApp : public Application {
+// ---------------- DownSender (root) ----------------
+class DownSender : public Application {
 public:
-  RootDioApp() {}
-  void Configure(Ptr<DRM> drm, Time interval, bool deterministic) {
-    m_drm = drm; m_interval = interval; m_det = deterministic;
+  DownSender() = default;
+  void Setup(const std::vector<Inet6SocketAddress> &dests, double rateKbps, uint32_t pktSize, MetricsCollector *m) {
+    m_dests = dests;
+    m_pktSize = pktSize;
+    m_metrics = m;
+    double bitsPerPkt = static_cast<double>(pktSize) * 8.0;
+    double totalPps = (rateKbps * 1000.0) / bitsPerPkt;
+    m_gap = Seconds( (totalPps > 0.0) ? (1.0 / totalPps) : 0.05 );
   }
-  void StartApplication() override { SendOnce(); }
-  void StopApplication() override { Simulator::Cancel(m_event); }
 
 private:
-  void SendOnce() {
-    uint8_t payload[8];
-    if (m_det) {
-      uint8_t fixed[8] = {0xAA,0xBB,0xCC,0xDD,0x11,0x22,0x33,0x44};
-      memcpy(payload, fixed, 8);
-    } else {
-      for (int i = 0; i < 8; ++i) payload[i] = std::rand() % 256;
-    }
-    std::vector<uint8_t> v(payload, payload + 8);
-    m_drm->SendBroadcastDio(v);
-    NS_LOG_INFO("Root sent DIO (hash=" << Crc16(v.data(), v.size()) << ") t=" << Simulator::Now().GetSeconds());
-    m_event = Simulator::Schedule(m_interval, &RootDioApp::SendOnce, this);
-  }
-
-  Ptr<DRM> m_drm;
-  EventId m_event;
-  Time m_interval;
-  bool m_det;
-};
-
-// ===================================================
-// Attacker app (same logic, minor renames)
-// ===================================================
-class ReplayAttacker : public Application {
-public:
-  ReplayAttacker() {}
-  void Configure(Ptr<Node> node, double rate, Time start, bool perturb) { m_node = node; m_rate = rate; m_start = start; m_pert = perturb; }
   void StartApplication() override {
-    TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-    m_socket = Socket::CreateSocket(m_node, tid);
-    InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), DIO_PORT);
-    m_socket->Bind(local);
-    m_socket->SetRecvCallback(MakeCallback(&ReplayAttacker::OnRecv, this));
-    Simulator::Schedule(m_start, &ReplayAttacker::Replay, this);
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_event = Simulator::Schedule(Seconds(1.0), &DownSender::Tick, this);
+  }
+  void StopApplication() override {
+    if (m_event.IsPending()) Simulator::Cancel(m_event);
+    if (m_socket) m_socket->Close();
+  }
+  void Tick() {
+    if (m_dests.empty()) { m_event = EventId(); return; }
+    Inet6SocketAddress to = m_dests[m_rr % m_dests.size()];
+    PayloadHdr ph; ph.seq = m_seq++; ph.txTime = Simulator::Now().GetSeconds();
+    Ptr<Packet> p = Create<Packet>(reinterpret_cast<uint8_t*>(&ph), sizeof(ph));
+    uint32_t pad = (m_pktSize > sizeof(ph)) ? (m_pktSize - sizeof(ph)) : 0;
+    if (pad) { Ptr<Packet> padp = Create<Packet>(pad); p->AddAtEnd(padp); }
+    m_socket->SendTo(p, 0, Address(to));
+    if (m_metrics) m_metrics->NoteTxPacket(p);
+    m_rr++;
+    m_event = Simulator::Schedule(m_gap, &DownSender::Tick, this);
+  }
+
+  Ptr<Socket> m_socket;
+  EventId m_event;
+  std::vector<Inet6SocketAddress> m_dests;
+  uint32_t m_pktSize{60};
+  Time m_gap{MilliSeconds(50)};
+  MetricsCollector *m_metrics{nullptr};
+  uint32_t m_seq{0};
+  size_t m_rr{0};
+};
+
+// ---------------- DownSink (leaf) ----------------
+class DownSink : public Application {
+public:
+  DownSink() = default;
+  void Setup(uint16_t port, MetricsCollector *m) { m_port = port; m_metrics = m; }
+
+private:
+  void StartApplication() override {
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_socket->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), m_port));
+    m_socket->SetRecvCallback(MakeCallback(&DownSink::HandleRecv, this));
   }
   void StopApplication() override { if (m_socket) m_socket->Close(); }
-
-private:
-  void OnRecv(Ptr<Socket> sock) {
-    Address from; Ptr<Packet> p = sock->RecvFrom(from);
-    std::vector<uint8_t> buf(p->GetSize()); p->CopyData(buf.data(), buf.size());
-    m_last = buf;
-    NS_LOG_INFO("Attacker captured DIO len=" << buf.size());
-  }
-  void Replay() {
-    if (m_last.empty()) { Simulator::Schedule(Seconds(0.5), &ReplayAttacker::Replay, this); return; }
-    std::vector<uint8_t> msg = m_last;
-    if (m_pert && !msg.empty()) msg[std::rand() % msg.size()] ^= (std::rand() % 4);
-    Ptr<Socket> tx = Socket::CreateSocket(m_node, UdpSocketFactory::GetTypeId());
-    tx->SetAllowBroadcast(true);
-    InetSocketAddress dst = InetSocketAddress(Ipv4Address("255.255.255.255"), DIO_PORT);
-    tx->Connect(dst);
-    Ptr<Packet> pkt = Create<Packet>(msg.data(), msg.size());
-    tx->Send(pkt);
-    tx->Close();
-    Simulator::Schedule(Seconds(1.0 / m_rate), &ReplayAttacker::Replay, this);
+  void HandleRecv(Ptr<Socket> s) {
+    Address from;
+    Ptr<Packet> p = s->RecvFrom(from);
+    if (!p) return;
+    if (p->GetSize() >= sizeof(PayloadHdr)) {
+      PayloadHdr ph;
+      p->CopyData(reinterpret_cast<uint8_t*>(&ph), sizeof(ph));
+      Time delay = Seconds(Simulator::Now().GetSeconds() - ph.txTime);
+      if (m_metrics) m_metrics->NoteRxPacket(p, delay);
+    } else {
+      if (m_metrics) m_metrics->NoteRxPacket(p, MilliSeconds(1));
+    }
   }
 
-  Ptr<Node> m_node;
   Ptr<Socket> m_socket;
-  std::vector<uint8_t> m_last;
-  double m_rate;
-  Time m_start;
-  bool m_pert;
+  uint16_t m_port{0};
+  MetricsCollector *m_metrics{nullptr};
 };
 
-// ===================================================
-// main - same behaviour and outputs as the original
-// ===================================================
-int main(int argc, char *argv[]) {
-  uint32_t nNodes = 20;
-  double spacing = 20.0;
-  uint32_t gridWidth = 5;
-  double simTime = 60.0;
-  bool deterministicRoot = true;
-  bool randomizeAttacker = false;
-  bool disableRootProtection = true;
-  double attackerRate = 5.0;
-  double attackStart = 12.0;
-
-  CommandLine cmd;
-  cmd.AddValue("nNodes", "Number of nodes", nNodes);
-  cmd.AddValue("spacing", "Grid spacing (m)", spacing);
-  cmd.AddValue("gridWidth", "Nodes per row", gridWidth);
-  cmd.AddValue("simTime", "Simulation time", simTime);
-  cmd.AddValue("deterministicRoot", "Fixed DIO payloads (true/false)", deterministicRoot);
-  cmd.AddValue("randomizeAttacker", "Replay with small changes", randomizeAttacker);
-  cmd.AddValue("disableRootProtection", "Disable root protection", disableRootProtection);
-  cmd.AddValue("attackerRate", "Replay rate", attackerRate);
-  cmd.AddValue("attackStart", "Replay start time", attackStart);
-  cmd.Parse(argc, argv);
-
-  std::srand((unsigned)time(nullptr));
-  LogComponentEnable("RplDioReplayVariant", LOG_LEVEL_INFO);
-
-  NodeContainer nodes;
-  nodes.Create(nNodes);
-
-  // WiFi
-  YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
-  YansWifiPhyHelper phy;
-  phy.SetChannel(channel.Create());
-  WifiHelper wifi;
-  wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                               "DataMode", StringValue("OfdmRate6Mbps"),
-                               "ControlMode", StringValue("OfdmRate6Mbps"));
-  WifiMacHelper mac;
-  mac.SetType("ns3::AdhocWifiMac");
-  NetDeviceContainer devs = wifi.Install(phy, mac, nodes);
-
-  // Mobility
-  MobilityHelper mobility;
-  mobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                "MinX", DoubleValue(0.0),
-                                "MinY", DoubleValue(0.0),
-                                "DeltaX", DoubleValue(spacing),
-                                "DeltaY", DoubleValue(spacing),
-                                "GridWidth", UintegerValue(gridWidth),
-                                "LayoutType", StringValue("RowFirst"));
-  mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-  mobility.Install(nodes);
-
-  // IP stack
-  InternetStackHelper internet;
-  internet.Install(nodes);
-  Ipv4AddressHelper ipv4;
-  ipv4.SetBase("10.1.1.0", "255.255.255.0");
-  Ipv4InterfaceContainer ifs = ipv4.Assign(devs);
-
-  // DRM instances
-  std::vector<Ptr<DRM>> drm(nNodes);
-  for (uint32_t i = 0; i < nNodes; ++i) {
-    Ptr<DRM> d = CreateObject<DRM>(nodes.Get(i));
-    d->Init(nodes.Get(i)->GetObject<Ipv4>());
-    d->DisableRootProtection(disableRootProtection);
-    drm[i] = d;
+// ---------------- Mitigator (root) ----------------
+class Mitigator : public Application {
+public:
+  Mitigator() = default;
+  void Setup(uint16_t port, uint32_t threshold, double windowSec, MetricsCollector *m) {
+    m_port = port; m_threshold = threshold; m_window = Seconds(windowSec); m_metrics = m;
   }
 
-  // root
-  Ptr<RootDioApp> root = CreateObject<RootDioApp>();
-  root->Configure(drm[0], Seconds(5.0), deterministicRoot);
-  nodes.Get(0)->AddApplication(root);
-  root->SetStartTime(Seconds(1.0));
-  root->SetStopTime(Seconds(simTime));
+private:
+  void StartApplication() override {
+    m_sock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_sock->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), m_port));
+    m_sock->SetRecvCallback(MakeCallback(&Mitigator::HandleRead, this));
+    g_mitigationEnabled = true;
+  }
+  void StopApplication() override { 
+    if (m_sock) m_sock->Close(); 
+    g_mitigationEnabled = false;
+  }
 
-  // attacker
-  Ptr<ReplayAttacker> attacker = CreateObject<ReplayAttacker>();
-  attacker->Configure(nodes.Get(nNodes - 1), attackerRate, Seconds(attackStart), randomizeAttacker);
-  nodes.Get(nNodes - 1)->AddApplication(attacker);
-  attacker->SetStartTime(Seconds(0.5));
-  attacker->SetStopTime(Seconds(simTime));
+  void HandleRead(Ptr<Socket> s) {
+    Address from;
+    Ptr<Packet> p;
+    while ((p = s->RecvFrom(from))) {
+      if (!Inet6SocketAddress::IsMatchingType(from)) continue;
+      Ipv6Address src = Inet6SocketAddress::ConvertFrom(from).GetIpv6();
+      Time now = Simulator::Now();
+      auto &dq = m_state[src].arrivals;
+      dq.push_back(now);
+      
+      while (!dq.empty() && now - dq.front() > m_window) dq.pop_front();
+      
+      if (dq.size() <= m_threshold) {
+        if (m_metrics) m_metrics->NoteControlRx();
+        // Remove from blocked list if present
+        g_blockedSources.erase(src);
+      } else {
+        if (m_metrics) m_metrics->NoteControlDropped();
+        // Add to blocked list to prevent future packets at MAC layer
+        g_blockedSources.insert(src);
+      }
+    }
+  }
+
+  struct SState { std::deque<Time> arrivals; };
+  std::map<Ipv6Address, SState> m_state;
+
+  Ptr<Socket> m_sock;
+  uint16_t m_port{0};
+  Time m_window{Seconds(1)};
+  uint32_t m_threshold{20};
+  MetricsCollector *m_metrics{nullptr};
+};
+
+// ---------------- Smart Attacker with adaptive rate ----------------
+class SmartAttacker : public Application {
+public:
+  SmartAttacker() : m_pps(0), m_pktBytes(0), m_startTime(0), m_duration(0), 
+                    m_metrics(nullptr), m_blocked(false) {}
+  
+  void Setup(Inet6SocketAddress dest, double pps, uint32_t pktBytes, double start, double duration, MetricsCollector *m) {
+    m_dest = dest;
+    m_pps = pps;
+    m_pktBytes = pktBytes;
+    m_startTime = start;
+    m_duration = duration;
+    m_metrics = m;
+    m_interval = (pps > 0) ? Seconds(1.0 / pps) : Seconds(0.01);
+  }
+
+private:
+  void StartApplication() override {
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_socket->Connect(Address(m_dest));
+    m_event = Simulator::Schedule(Seconds(m_startTime), &SmartAttacker::SendPacket, this);
+  }
+  
+  void StopApplication() override {
+    if (m_event.IsPending()) Simulator::Cancel(m_event);
+    if (m_socket) m_socket->Close();
+  }
+  
+  void SendPacket() {
+    double now = Simulator::Now().GetSeconds();
+    if (now >= m_startTime + m_duration) return;
+    
+    // Check if we're blocked
+    if (g_mitigationEnabled) {
+      Ptr<Node> node = GetNode();
+      Ptr<Ipv6> ipv6 = node->GetObject<Ipv6>();
+      if (ipv6) {
+        Ipv6Address myAddr = ipv6->GetAddress(1, 1).GetAddress();
+        if (g_blockedSources.find(myAddr) != g_blockedSources.end()) {
+          // We're blocked - reduce rate drastically (90% drop)
+          if (!m_blocked) {
+            m_blocked = true;
+            m_interval = m_interval * 10.0; // Slow down 10x
+          }
+          // Random drop: only send 10% of packets when blocked
+          if (rand() % 10 != 0) {
+            m_event = Simulator::Schedule(m_interval, &SmartAttacker::SendPacket, this);
+            return;
+          }
+        } else {
+          m_blocked = false;
+        }
+      }
+    }
+    
+    Ptr<Packet> p = Create<Packet>(m_pktBytes);
+    int result = m_socket->Send(p);
+    
+    if (result >= 0) {
+      if (m_metrics) m_metrics->NoteControlTx();
+    }
+    
+    m_event = Simulator::Schedule(m_interval, &SmartAttacker::SendPacket, this);
+  }
+
+  Ptr<Socket> m_socket;
+  EventId m_event;
+  Inet6SocketAddress m_dest{Ipv6Address::GetAny(), 0};
+  double m_pps;
+  uint32_t m_pktBytes;
+  double m_startTime;
+  double m_duration;
+  Time m_interval{Seconds(0.01)};
+  MetricsCollector *m_metrics;
+  bool m_blocked;
+};
+
+// ---------------- main ----------------
+int main(int argc, char *argv[]) {
+  srand(time(nullptr));
+  
+  // defaults
+  uint32_t nNodes = 25;
+  double area = 60.0;
+  bool attack = false;
+  double rateKbps = 16;
+  double simTime = 120;
+  uint32_t threshold = 20;
+  double windowSec = 1.0;
+  double attackerPps = 600.0;
+  uint32_t attackerPkt = 120;
+
+  CommandLine cmd;
+  cmd.AddValue("nNodes", "Total nodes (root + leaves)", nNodes);
+  cmd.AddValue("area", "Deployment side (meters)", area);
+  cmd.AddValue("attack", "Enable attacker flood", attack);
+  cmd.AddValue("rateKbps", "Downward application rate (kbps)", rateKbps);
+  cmd.AddValue("simTime", "Simulation time (s)", simTime);
+  cmd.AddValue("threshold", "Mitigator threshold (pkts per window)", threshold);
+  cmd.AddValue("windowSec", "Mitigator window in seconds", windowSec);
+  cmd.AddValue("attackerPps", "Attacker packets per second", attackerPps);
+  cmd.AddValue("attackerPkt", "Attacker packet payload bytes", attackerPkt);
+  cmd.Parse(argc, argv);
+
+  NS_ABORT_MSG_IF(nNodes < 2, "Need at least 2 nodes.");
+
+  NodeContainer nodes; nodes.Create(nNodes);
+
+  // Mobility (grid)
+  MobilityHelper mob;
+  Ptr<ListPositionAllocator> pos = CreateObject<ListPositionAllocator>();
+  uint32_t gridW = std::max(1u, (uint32_t)std::ceil(std::sqrt((double)nNodes)));
+  double step = (gridW > 1) ? (area / (gridW - 1)) : 0.0;
+  for (uint32_t i = 0; i < nNodes; ++i) {
+    uint32_t x = i % gridW, y = i / gridW;
+    pos->Add(Vector(5.0 + x * step, 5.0 + y * step, 0));
+  }
+  mob.SetPositionAllocator(pos);
+  mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+  mob.Install(nodes);
+
+  // LR-WPAN
+  LrWpanHelper lrwpan;
+  NetDeviceContainer devs = lrwpan.Install(nodes);
+
+  const uint16_t PAN = 0xBAAD;
+  for (uint32_t i = 0; i < devs.GetN(); ++i) {
+    Ptr<LrWpanNetDevice> d = DynamicCast<LrWpanNetDevice>(devs.Get(i));
+    NS_ASSERT(d);
+    Ptr<LrWpanMac> mac = d->GetMac();
+    mac->SetPanId(PAN);
+    uint16_t shortId = static_cast<uint16_t>(i + 1);
+    uint64_t extId = 0x0000000000000001ULL + static_cast<uint64_t>(i);
+    mac->SetShortAddress(Mac16Address(shortId));
+    mac->SetExtendedAddress(Mac64Address(extId));
+  }
+
+  // 6LoWPAN
+  SixLowPanHelper sixlow;
+  NetDeviceContainer six = sixlow.Install(devs);
+
+  // IPv6
+  InternetStackHelper internet; internet.Install(nodes);
+  Ipv6AddressHelper ipv6; ipv6.SetBase(Ipv6Address("2001:db8::"), Ipv6Prefix(64));
+  Ipv6InterfaceContainer ifs = ipv6.Assign(six);
+  for (uint32_t i = 0; i < ifs.GetN(); ++i) { 
+    ifs.SetForwarding(i, true); 
+    ifs.SetDefaultRouteInAllNodes(i); 
+  }
+
+  // Metrics
+  static MetricsCollector metrics;
+
+  // Downward traffic
+  uint16_t dataPort = 9000;
+  std::vector<Inet6SocketAddress> dests;
+  for (uint32_t i = 1; i < nodes.GetN(); ++i) {
+    dests.push_back(Inet6SocketAddress(ifs.GetAddress(i,1), dataPort));
+    Ptr<DownSink> sink = CreateObject<DownSink>();
+    sink->Setup(dataPort, &metrics);
+    nodes.Get(i)->AddApplication(sink);
+    sink->SetStartTime(Seconds(10));
+    sink->SetStopTime(Seconds(simTime - 1));
+  }
+
+  Ptr<DownSender> sender = CreateObject<DownSender>();
+  sender->Setup(dests, rateKbps, 60, &metrics);
+  nodes.Get(0)->AddApplication(sender);
+  sender->SetStartTime(Seconds(11));
+  sender->SetStopTime(Seconds(simTime - 0.5));
+
+  // Mitigator (root)
+  uint16_t ctrlPort = 61616;
+  Ptr<Mitigator> mit = CreateObject<Mitigator>();
+  mit->Setup(ctrlPort, threshold, windowSec, &metrics);
+  nodes.Get(0)->AddApplication(mit);
+  mit->SetStartTime(Seconds(5));
+  mit->SetStopTime(Seconds(simTime));
+
+  // Attacker
+  if (attack) {
+    Ptr<SmartAttacker> atk = CreateObject<SmartAttacker>();
+    atk->Setup(
+      Inet6SocketAddress(ifs.GetAddress(0,1), ctrlPort),
+      attackerPps,
+      attackerPkt,
+      12.0,
+      simTime - 13.0,
+      &metrics
+    );
+    nodes.Get(nNodes - 1)->AddApplication(atk);
+    atk->SetStartTime(Seconds(12));
+    atk->SetStopTime(Seconds(simTime - 1));
+  }
 
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
-
-  uint32_t totalControl = 0, totalDropped = 0;
-  for (auto &d : drm) {
-    totalControl += d->GetRootSends();
-    totalDropped += d->GetDroppedCount();
-  }
-
-  uint32_t totalMitigationDrops = 0;
-  for (auto &d : drm) totalMitigationDrops += d->GetMitigationDrops();
-
-  std::cout << "\n=== SIMULATION COMPLETE ===\n";
-  std::cout << "Total DIOs processed: " << totalControl << "\n";
-  std::cout << "Total DIOs dropped (blacklisted + others): " << totalDropped << "\n";
-  std::cout << "DIOs dropped due to mitigation: " << totalMitigationDrops << "\n";
-  std::cout << "Attack rate: " << attackerRate << " per sec, started at " << attackStart << "s\n";
-
-  uint32_t totalSuspicious = 0, totalBlacklists = 0, totalReceived = 0;
-  Time firstDetection = Seconds(-1);
-  for (auto &d : drm) {
-    totalSuspicious += d->GetSuspiciousEvents();
-    totalBlacklists += d->GetBlacklistCount();
-    totalReceived += d->GetTotalReceived();
-    Time t = d->GetFirstBlacklistTime();
-    if (t != Seconds(-1)) {
-      if (firstDetection == Seconds(-1) || t < firstDetection) firstDetection = t;
-    }
-  }
-
-  std::cout << "Total DIOs received: " << totalReceived << "\n";
-  std::cout << "Total suspicious events: " << totalSuspicious << "\n";
-  std::cout << "Total blacklist events: " << totalBlacklists << "\n";
-
-  if (firstDetection != Seconds(-1)) std::cout << "Detection time (first blacklist): " << firstDetection.GetSeconds() << "s\n";
-  else std::cout << "Detection time: NONE (no node blacklisted attacker)\n";
-
-  std::cout << "============================\n";
-
   Simulator::Destroy();
+
+  metrics.WriteCsv("run1");
+  return 0;
 }
